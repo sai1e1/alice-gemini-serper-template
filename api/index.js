@@ -1,10 +1,39 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const LLM_TIMEOUT_MS = 3000;
+
+// Провайдер выбирается переменной LLM_PROVIDER.
+// baseUrl и model можно переопределить через LLM_BASE_URL и LLM_MODEL.
+const PROVIDERS = {
+  // openrouter/free — роутер, который сам выбирает одну из бесплатных моделей
+  openrouter: { kind: "openai", baseUrl: "https://openrouter.ai/api/v1", model: "openrouter/free" },
+  groq: { kind: "openai", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  mistral: { kind: "openai", baseUrl: "https://api.mistral.ai/v1", model: "mistral-small-latest" },
+  // В модели YandexGPT вместо <folder_id> подставьте идентификатор каталога Yandex Cloud.
+  yandex: { kind: "openai", baseUrl: "https://llm.api.cloud.yandex.net/v1", model: "gpt://<folder_id>/yandexgpt-lite/latest" },
+  gemini: { kind: "google", baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-2.0-flash" }
+};
+
+const DEFAULT_PROVIDER = "openrouter";
+
+function resolveLlmConfig(env = process.env) {
+  const requested = String(env.LLM_PROVIDER || (env.GEMINI_API_KEY ? "gemini" : DEFAULT_PROVIDER))
+    .trim()
+    .toLowerCase();
+  const preset = PROVIDERS[requested];
+  if (!preset) throw new Error("UNKNOWN_PROVIDER");
+
+  const model = String(
+    env.LLM_MODEL || (requested === "gemini" ? env.GEMINI_MODEL : "") || preset.model
+  ).trim();
+  const apiKey = String(env.LLM_API_KEY || (requested === "gemini" ? env.GEMINI_API_KEY : "") || "").trim();
+  const baseUrl = String(env.LLM_BASE_URL || preset.baseUrl).trim().replace(/\/+$/, "");
+
+  return { provider: requested, kind: preset.kind, baseUrl, model, apiKey };
+}
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -110,31 +139,50 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+function buildPrompt(text, searchContext) {
+  return searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
+}
+
+async function askLlm(text, history, searchContext, timeoutMs) {
+  const config = resolveLlmConfig();
+  if (!config.apiKey) throw new Error("MISSING_LLM_KEY");
+  if (!config.model || config.model.includes("<folder_id>")) throw new Error("MISSING_MODEL");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const budget = Math.min(LLM_TIMEOUT_MS, timeoutMs);
+  const prompt = buildPrompt(text, searchContext);
+
+  return config.kind === "google"
+    ? askGeminiNative(config, history, prompt, budget)
+    : askOpenAiCompatible(config, history, prompt, budget);
+}
+
+function throwLlmHttpError(label, status, detail) {
+  console.error(`${label} request failed with HTTP`, status, detail || "");
+  if (status === 401 || status === 403) throw new Error("LLM_KEY_REJECTED");
+  if (status === 404) throw new Error("LLM_MODEL_UNKNOWN");
+  if (status === 429) throw new Error("LLM_QUOTA");
+  throw new Error("LLM_REQUEST_FAILED");
+}
+
+async function askGeminiNative(config, history, prompt, budget) {
+  if (!/^[A-Za-z0-9._-]+$/.test(config.model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
   }));
-
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    `${config.baseUrl}/models/${config.model}:generateContent`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "x-goog-api-key": config.apiKey
       },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
@@ -145,16 +193,10 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    budget
   );
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
+  if (!response.ok) throwLlmHttpError("Gemini", Number(response.status));
 
   const candidate = data?.candidates?.[0];
   const answer = (candidate?.content?.parts || [])
@@ -163,8 +205,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     .trim();
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+    if (data?.promptFeedback?.blockReason) throw new Error("LLM_BLOCKED");
+    throw new Error("LLM_EMPTY_RESPONSE");
   }
   if (candidate?.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
@@ -172,15 +214,64 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
+async function askOpenAiCompatible(config, history, prompt, budget) {
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...safeHistory(history).map(item => ({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    })),
+    { role: "user", content: prompt }
+  ];
+
+  const { response, data } = await fetchJson(
+    `${config.baseUrl}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Yandex Cloud ждёт "Api-Key ...", остальные — обычный Bearer.
+        Authorization: config.provider === "yandex"
+          ? `Api-Key ${config.apiKey}`
+          : `Bearer ${config.apiKey}`
+      },
+      body: JSON.stringify({
+        model: config.model,
+        messages,
+        temperature: 0.5,
+        max_tokens: 240
+      })
+    },
+    budget
+  );
+
+  if (!response.ok) {
+    throwLlmHttpError(config.provider, Number(response.status), data?.error?.message);
+  }
+
+  const answer = String(data?.choices?.[0]?.message?.content ?? "").trim();
+  if (!answer) throw new Error("LLM_EMPTY_RESPONSE");
+  if (data?.choices?.[0]?.finish_reason === "length") {
+    console.warn("Model reached the output token limit.");
+  }
+  return answer;
+}
+
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
+    case "MISSING_LLM_KEY":
+      return "Сервер пока не настроен. Проверьте переменную LLM_API_KEY в настройках Vercel.";
+    case "MISSING_MODEL":
+      return "Сервер пока не настроен. Проверьте переменную LLM_MODEL в настройках Vercel.";
+    case "UNKNOWN_PROVIDER":
+      return "Сервер пока не настроен. Проверьте переменную LLM_PROVIDER в настройках Vercel.";
+    case "LLM_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+    case "LLM_MODEL_UNKNOWN":
+      return "Модель недоступна для этого ключа. Проверьте переменную LLM_MODEL в настройках Vercel.";
+    case "LLM_QUOTA":
+      return "Сейчас превышен лимит запросов к нейросети. Попробуйте немного позже.";
+    case "LLM_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
@@ -192,10 +283,24 @@ function errorForUser(error) {
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
+    let llm;
+    try {
+      const config = resolveLlmConfig();
+      llm = {
+        provider: config.provider,
+        model: config.model,
+        keyConfigured: Boolean(config.apiKey),
+        searchConfigured: Boolean(process.env.SERPER_API_KEY)
+      };
+    } catch (error) {
+      llm = { error: error?.message || "UNKNOWN_PROVIDER" };
+    }
+
     return res.status(200).json({
       ok: true,
       service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api.",
+      llm
     });
   }
 
@@ -225,11 +330,11 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askLlm(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, remainingMs() - 500)
     );
 
     const history = [
@@ -246,4 +351,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, resolveLlmConfig };
